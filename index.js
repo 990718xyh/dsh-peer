@@ -150,7 +150,20 @@ export function apply(ctx, config) {
 
   // ---- 投递 -------------------------------------------------------------
 
-  const PEER_TAG = /^(?:\[[^\]\n]+\([^)\n]+\)\]|\[来自 [^\]\n]+\])/
+  // 新头 [peer v1 from=.. session=.. host=.. hop=.. auto=..] 和老前缀都认，
+  // 老格式是为了过渡期：对端还没升级时，消息照样能被识别成「对端注入」。
+  const PEER_TAG = /^(?:\[peer v\d[^\]\n]*\]|\[[^\]\n]+\([^)\n]+\)\]|\[来自 [^\]\n]+\])/
+
+  /**
+   * 拼注入头部。
+   *
+   * `session` 是**发送方**的会话 id，由对端在报文里带过来。
+   * 不能在接收方这边算：入队那一刻接收方可能压根没有 agent，算不出来；
+   * 而且头部要标的是「谁发的」，不是「谁收的」。
+   */
+  function buildHeader({ from, session, host, hop, auto }) {
+    return `[peer v${PROTOCOL_VERSION} from=${from} session=${session || 'unknown'} host=${host ?? 'unknown'} hop=${hop ?? 0} auto=${auto === true}]`
+  }
 
   function isPeerInjected(text) {
     return typeof text === 'string' && PEER_TAG.test(text.trimStart())
@@ -175,7 +188,7 @@ export function apply(ctx, config) {
         content: [
           {
             type: 'text',
-            text: `[${item.from}] 以下不是主人说的话：\n${item.text}`,
+            text: `${item.header ?? `[${item.from}]`}\n以下不是主人说的话：\n${item.text}`,
           },
         ],
         source: { kind: 'user' },
@@ -225,16 +238,23 @@ export function apply(ctx, config) {
     seen.add(id)
     if (seen.size > 4000) seen.clear()
 
-    const item = {
-      id,
+    const meta = {
       from: typeof payload.from === 'string' && payload.from ? payload.from : 'peer',
-      text,
-      ts: Number(payload.ts) || Date.now(),
+      // 对端的会话 id，原样搬运，不做任何计算
+      session: typeof payload.session === 'string' ? payload.session : '',
       // 回程要用连接的对端地址；from 只是名字，不能拿来连
       host: typeof remoteAddress === 'string' ? remoteAddress.replace(/^::ffff:/, '') : null,
       // 对端带过来的跳数；手动发的没有，按 0 算
       hop: Number.isInteger(payload.hop) ? payload.hop : 0,
       auto: payload.auto === true,
+    }
+    const item = {
+      id,
+      text,
+      ts: Number(payload.ts) || Date.now(),
+      ...meta,
+      // 在这里算好存下：入队后可能过几分钟才投递，那时会话已经换了
+      header: buildHeader(meta),
     }
     const result = deliverNow(item)
     if (result.ok) return { ok: true, to: result.to, id }
@@ -322,7 +342,10 @@ export function apply(ctx, config) {
       }
       const timer = setTimeout(() => finish(null), timeoutMs)
       socket.on('connect', () =>
-        socket.write(`${JSON.stringify({ token: opts.token, v: PROTOCOL_VERSION, ...payload })}\n`),
+        socket.write(
+          // session 是本端会话 id，跟着报文一起过去，让对端的头部能标出发送方
+          `${JSON.stringify({ token: opts.token, v: PROTOCOL_VERSION, session: lastActive || '', ...payload })}\n`,
+        ),
       )
       socket.on('data', (chunk) => {
         buffer += chunk
@@ -419,16 +442,22 @@ export function apply(ctx, config) {
     execute: async ({ text }) => {
       const body = typeof text === 'string' ? text.trim() : ''
       if (!body) return { ok: false, reason: 'empty-text' }
+      // 回程轮次（这一轮是被对端消息触发的）不要手动发：
+      // 轮末会自动把回复带回去，再手动发一次对方就收到两遍。
+      const inReplyTurn = reply.pending !== null
       const online = await verifyPeer()
       if (!online) return { ok: false, reason: 'no-verified-peer', host: opts.peerHost || null }
       const id = randomUUID()
-      const reply = await talk(
+      const sent = await talk(
         opts.peerHost,
         { from: `${opts.name}(${opts.platform})`, text: body, id, ts: Date.now(), hop: 0, auto: false },
         5000,
       )
-      if (!reply) return { ok: false, reason: 'no-reply', id }
-      return { ...reply, id }
+      if (!sent) return { ok: false, reason: 'no-reply', id }
+      if (inReplyTurn) {
+        return { ...sent, id, note: '这一轮结束时还会自动回传一次，对方可能收到两遍' }
+      }
+      return { ...sent, id }
     },
   }
 
@@ -467,7 +496,7 @@ export function apply(ctx, config) {
     ctx.systemPrompt.section({
       name: 'peer:convention',
       order: 4000,
-      text: `以 [名字(平台)] 开头的 user 消息来自另一台机器上的 agent，不是主人的原话。收到这类消息的那一轮，结束时系统会把这一轮最后一条回复自动发回去，所以不必再手动回；只有想主动说一句、或者不在回程轮次时，才用 peer_send。`,
+      text: `以 [peer v1 from=…] 或 [名字(平台)] 开头的 user 消息来自另一台机器上的 agent，不是主人的原话。收到这类消息的那一轮，结束时系统会把这一轮最后一条回复自动发回去，所以不必再手动回；只有想主动说一句、或者不在回程轮次时，才用 peer_send。`,
     }),
   )
 

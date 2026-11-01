@@ -127,7 +127,7 @@ A.emit('agent/created', { agent: { id: 'sess-a', followup: (message) => A.inbox.
 await sleep(150)
 check('agent 起来后补投', A.inbox.length === 1, A.inbox.length)
 const injected = A.inbox[0]?.content?.[0]?.text ?? ''
-check('注入带对方名字和免责句', injected.startsWith('[尺(Mac)]') && injected.includes('不是主人说的话'), injected)
+check('注入带对端标识和免责句', injected.startsWith('[peer v1 from=尺(Mac) ') && injected.includes('不是主人说的话'), injected)
 
 // 3) 有 agent 时直接投递
 const direct = asObject(await B.tools.get('peer_send').execute({ text: '第二条，直达' }))
