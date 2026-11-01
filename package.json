@@ -1,0 +1,41 @@
+{
+  "name": "dsh-peer",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "跨机 agent 直连桥：peer_send / peer_status 两个工具，先验身份再发正文，收到入队并在有 agent 时投递。",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "test"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/990718xyh/dsh-peer"
+  },
+  "homepage": "https://github.com/990718xyh/dsh-peer#readme",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "peer",
+    "bridge",
+    "多机"
+  ],
+  "scripts": {
+    "test": "node test/smoke.mjs"
+  }
+}

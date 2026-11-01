@@ -1,0 +1,1 @@
+{ "meta": { "title": "Peer Bridge", "description": "Talk to an agent on another machine: verify identity before sending, queue inbound messages until an agent is live." } }
