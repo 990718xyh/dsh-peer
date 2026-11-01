@@ -499,7 +499,13 @@ export function apply(ctx, config) {
     'agent/inbox/claimed',
     (payload) => {
       const agent = payload?.agent
-      if (!agent?.id || !agents.has(agent.id)) return
+      if (!agent?.id) return
+      // 热重载后表是空的：这里顺手补登记，不然投递永远找不到 agent
+      if (!agents.has(agent.id)) {
+        agents.set(agent.id, agent)
+        if (!lastActive) lastActive = agent.id
+        setTimeout(flush, 0)
+      }
       const message = payload?.message
       const blocks = Array.isArray(message?.content) ? message.content : []
       const text = blocks.filter((block) => block?.type === 'text').map((block) => block.text ?? '').join('')
@@ -515,7 +521,23 @@ export function apply(ctx, config) {
   // 事件派发带 scope，监听器必须 global，否则轮末收不到。
   ctx.on(
     'session/event',
-    (_session, event) => {
+    (session, event) => {
+      // 热重载后 agents 表是空的（agent/created 早发过了）。
+      // 这里借 session 事件把当前 agent 从 ctx.agents 里补回来。
+      if (agents.size === 0 && session) {
+        const id = session.id ?? session.header?.id
+        try {
+          const live = id ? ctx.get('agents')?.get?.(id) : null
+          if (live?.id) {
+            agents.set(live.id, live)
+            if (!lastActive) lastActive = live.id
+            log('从 session 事件补登记 agent')
+            setTimeout(flush, 0)
+          }
+        } catch {
+          /* 拿不到就算了，不阻塞事件处理 */
+        }
+      }
       if (!event || typeof event.type !== 'string') return
 
       if (event.type === 'assistant/message') {
