@@ -566,6 +566,16 @@ export function apply(ctx, config) {
       }
       if (!event || typeof event.type !== 'string') return
 
+      // 主人说话了：这一轮不是纯回程轮次，别把他的问题带回去。
+      // 判据是 user 消息正文——对端注入的带 [peer v1 …] 头，主人打的不带。
+      // 之前缺这一条：对端消息设的 pending 会一直留到轮末，
+      // 主人中途插一句，他的原话就跟着被回传给对端了。
+      if (event.type === 'user/message') {
+        const text = contentText(event)
+        if (!isPeerInjected(text)) reply.pending = null
+        return
+      }
+
       if (event.type === 'assistant/message') {
         const text = contentText(event)
         if (text.trim()) reply.lastText = text
@@ -589,8 +599,19 @@ export function apply(ctx, config) {
         return
       }
 
-      // 一轮只发一条：本轮 peer_send 攒的 + 本轮回复，合并后一次发出
-      const parts = [...staged, body].filter((part) => typeof part === 'string' && part.trim())
+      // 主动轮 = 主人正在跟我说话，不是对端在问我。
+      // 这种轮次只能发 peer_send 明确攒下的内容；我的普通回复绝不能被带出去——
+      // 之前缺这条判断，主人在对端消息之后插一句话，他的问题就跟着被回传给对端了。
+      if (!pending && staged.length === 0) {
+        reply.skipped += 1
+        audit('auto-reply-skip', { reason: 'owner-turn' })
+        return
+      }
+
+      // 一轮只发一条：回程轮 = 攒的 + 本轮回复；主动轮 = 只有攒的
+      const parts = (pending ? [...staged, body] : [...staged]).filter(
+        (part) => typeof part === 'string' && part.trim(),
+      )
       if (parts.length === 0) {
         reply.skipped += 1
         audit('auto-reply-skip', { reason: 'empty-turn-text' })
