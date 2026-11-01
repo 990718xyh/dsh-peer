@@ -116,8 +116,9 @@ apply(C.ctx, {
 await sleep(250)
 
 // 1) 没 agent 时入队
-const queued = await B.tools.get('peer_send').execute({ text: '第一条，入队' })
-const queuedValue = JSON.parse(queued)
+// tool.execute 有时回对象、有时回 JSON 字符串，两种都接住
+const asObject = (value) => (typeof value === 'string' ? JSON.parse(value) : value)
+const queuedValue = asObject(await B.tools.get('peer_send').execute({ text: '第一条，入队' }))
 check('无 agent 时入队', queuedValue.ok === true && queuedValue.queued === 1, queuedValue)
 check('入队时 A 没有收到', A.inbox.length === 0, A.inbox.length)
 
@@ -129,7 +130,7 @@ const injected = A.inbox[0]?.content?.[0]?.text ?? ''
 check('注入带对方名字和免责句', injected.startsWith('[尺(Mac)]') && injected.includes('不是主人说的话'), injected)
 
 // 3) 有 agent 时直接投递
-const direct = JSON.parse(await B.tools.get('peer_send').execute({ text: '第二条，直达' }))
+const direct = asObject(await B.tools.get('peer_send').execute({ text: '第二条，直达' }))
 check('有 agent 时直达', direct.ok === true && direct.to === 'sess-a', direct)
 check('直达不入队', direct.queued === undefined, direct)
 
@@ -151,7 +152,7 @@ const bad = await talk(18790, { token: 'wrong', from: 'x', text: 'y', id: random
 check('错 token 被拒', bad?.ok === false && bad.reason === 'bad-token', bad)
 
 // 7) 状态查询
-const status = JSON.parse(await B.tools.get('peer_status').execute({}))
+const status = asObject(await B.tools.get('peer_status').execute({}))
 check('状态能报到在线', status.online === true && status.queued === 0, status)
 
 fs.rmSync(root, { recursive: true, force: true })
