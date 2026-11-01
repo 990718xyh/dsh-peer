@@ -98,7 +98,9 @@ export function apply(ctx, config) {
 
   // 回程状态：只有「这一轮收到过对端消息」才在轮末自动回一段。
   // pending 记对端地址（socket.remoteAddress，不是 from 那个名字）和它带来的 hop。
-  const reply = { pending: null, lastText: '', sent: 0, skipped: 0 }
+  // queue：本轮攒下要发给对方的内容。peer_send 不立刻发，只往这里塞；
+  // 轮末合并成一条发出去。一轮只发一次，不会一条一句地刷。
+  const reply = { pending: null, lastText: '', sent: 0, skipped: 0, queue: [] }
 
   const AUDIT = path.join(dir, 'audit.jsonl')
 
@@ -343,8 +345,9 @@ export function apply(ctx, config) {
       const timer = setTimeout(() => finish(null), timeoutMs)
       socket.on('connect', () =>
         socket.write(
-          // session 是本端会话 id，跟着报文一起过去，让对端的头部能标出发送方
-          `${JSON.stringify({ token: opts.token, v: PROTOCOL_VERSION, session: lastActive || '', ...payload })}\n`,
+          // session 由调用方在 payload 里给；不给就是空，接收方会记成 unknown。
+          // 不要在这里兜底用 lastActive：那是「最近在跟谁说话」，多会话时会张冠李戴。
+          `${JSON.stringify({ token: opts.token, v: PROTOCOL_VERSION, session: '', ...payload })}\n`,
         ),
       )
       socket.on('data', (chunk) => {
@@ -367,18 +370,19 @@ export function apply(ctx, config) {
     return Boolean(reply && reply.ok === true && reply.pong === true)
   }
 
-  /** 自动回传：发一段回去。失败只写审计，不重试（重试会重复投递）。 */
-  async function autoReply(host, text, hop) {
+  /** 发一段出去。`auto` 决定要不要带 `[自动回传 hop=N]` 前缀（主动发的不带）。 */
+  async function autoReply(host, text, hop, auto = true) {
     const id = randomUUID()
+    const head = auto ? `[自动回传 hop=${hop}]\n` : ''
     const ack = await talk(
       host,
       {
         from: `${opts.name}(${opts.platform})`,
-        text: `[自动回传 hop=${hop}]\n${text}`,
+        text: `${head}${text}`,
         id,
         ts: Date.now(),
         hop,
-        auto: true,
+        auto,
       },
       5000,
     )
@@ -439,25 +443,18 @@ export function apply(ctx, config) {
       schema: { type: 'object', additionalProperties: true },
       render: renderSend,
     },
-    execute: async ({ text }) => {
+    execute: async ({ text }, exec) => {
       const body = typeof text === 'string' ? text.trim() : ''
       if (!body) return { ok: false, reason: 'empty-text' }
-      // 回程轮次（这一轮是被对端消息触发的）不要手动发：
-      // 轮末会自动把回复带回去，再手动发一次对方就收到两遍。
-      const inReplyTurn = reply.pending !== null
-      const online = await verifyPeer()
-      if (!online) return { ok: false, reason: 'no-verified-peer', host: opts.peerHost || null }
-      const id = randomUUID()
-      const sent = await talk(
-        opts.peerHost,
-        { from: `${opts.name}(${opts.platform})`, text: body, id, ts: Date.now(), hop: 0, auto: false },
-        5000,
-      )
-      if (!sent) return { ok: false, reason: 'no-reply', id }
-      if (inReplyTurn) {
-        return { ...sent, id, note: '这一轮结束时还会自动回传一次，对方可能收到两遍' }
+      // 发起者就是调用这个工具的 agent，不能拿 lastActive——那是「最近在跟谁说话」，
+      // 后台会话 A 发消息、我最近在跟 B 说话时，lastActive 是 B，就把 A 记成 B 了。
+      // 不立刻发：塞进本轮待发队列，轮末合并成一条发出去。
+      reply.queue.push(body)
+      return {
+        ok: true,
+        staged: reply.queue.length,
+        note: '已存入本轮待发队列，这一轮结束时会和本轮回复合并成一条发出',
       }
-      return { ...sent, id }
     },
   }
 
@@ -577,35 +574,55 @@ export function apply(ctx, config) {
       if (event.type !== 'turn/end') return
 
       const pending = reply.pending
+      const staged = reply.queue.slice()
+      reply.queue.length = 0
       const body = reply.lastText.trim()
       reply.pending = null
       reply.lastText = ''
-      if (!pending) return
 
       const turnReason = event?.data?.reason?.kind ?? 'unknown'
       if (turnReason !== 'completed') {
+        // 本轮没正常结束：攒下的内容别丢，放回去，下一轮一起发
+        reply.queue.unshift(...staged)
         reply.skipped += 1
-        audit('auto-reply-skip', { reason: 'turn-aborted', turnReason })
+        audit('auto-reply-skip', { reason: 'turn-aborted', turnReason, kept: staged.length })
         return
       }
-      if (!body) {
+
+      // 一轮只发一条：本轮 peer_send 攒的 + 本轮回复，合并后一次发出
+      const parts = [...staged, body].filter((part) => typeof part === 'string' && part.trim())
+      if (parts.length === 0) {
         reply.skipped += 1
         audit('auto-reply-skip', { reason: 'empty-turn-text' })
         return
       }
-      const hop = (Number(pending.hop) || 0) + 1
-      if (hop > 3) {
-        reply.skipped += 1
-        audit('auto-reply-skip', { reason: 'hop-limit', hop })
-        return
+      const merged = parts.join('\n\n---\n\n')
+
+      // 回程轮：回一跳就停（hop=1）；收到 hop>=1 的回传不再继续回，
+      // 否则两台机器会无限对着回。主动轮（主人在让我发消息）hop 从 0 起。
+      let host
+      let hop
+      let auto
+      if (pending) {
+        hop = (Number(pending.hop) || 0) + 1
+        if (hop > 1) {
+          reply.skipped += 1
+          audit('auto-reply-skip', { reason: 'hop-limit', hop })
+          return
+        }
+        host = pending.host || opts.peerHost
+        auto = true
+      } else {
+        hop = 0
+        host = opts.peerHost
+        auto = false
       }
-      const host = pending.host || opts.peerHost
       if (!host) {
         reply.skipped += 1
         audit('auto-reply-skip', { reason: 'no-host', hop })
         return
       }
-      void autoReply(host, body.slice(0, 1500), hop)
+      void autoReply(host, merged.slice(0, 3000), hop, auto)
     },
     { global: true },
   )

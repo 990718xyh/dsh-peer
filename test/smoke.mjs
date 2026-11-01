@@ -115,24 +115,29 @@ apply(C.ctx, {
 
 await sleep(250)
 
-// 1) 没 agent 时入队
+// 1) peer_send 只把内容攒进本轮队列，不立刻发
 // tool.execute 有时回对象、有时回 JSON 字符串，两种都接住
 const asObject = (value) => (typeof value === 'string' ? JSON.parse(value) : value)
-const queuedValue = asObject(await B.tools.get('peer_send').execute({ text: '第一条，入队' }))
-check('无 agent 时入队', queuedValue.ok === true && queuedValue.queued === 1, queuedValue)
+const stagedOne = asObject(await B.tools.get('peer_send').execute({ text: '第一条，先攒着' }))
+check('peer_send 只入库不发送', stagedOne.ok === true && stagedOne.staged === 1, stagedOne)
+const stagedTwo = asObject(await B.tools.get('peer_send').execute({ text: '第二条，也攒着' }))
+check('多次发送攒成一条队列', stagedTwo.staged === 2, stagedTwo)
+check('攒着的时候对方还没收到', A.inbox.length === 0, A.inbox.length)
+
+// 2) 对端发消息过来：没 agent 时入队，agent 起来后补投
+const queuedTalk = await talk(18790, { token: TOKEN, from: '尺(Mac)', text: '对端发来的', id: randomUUID() })
+check('无 agent 时对端消息入队', queuedTalk?.ok === true && queuedTalk?.queued === 1, queuedTalk)
 check('入队时 A 没有收到', A.inbox.length === 0, A.inbox.length)
 
-// 2) agent 起来后补投
 A.emit('agent/created', { agent: { id: 'sess-a', followup: (message) => A.inbox.push(message) } })
 await sleep(150)
 check('agent 起来后补投', A.inbox.length === 1, A.inbox.length)
 const injected = A.inbox[0]?.content?.[0]?.text ?? ''
 check('注入带对端标识和免责句', injected.startsWith('[peer v1 from=尺(Mac) ') && injected.includes('不是主人说的话'), injected)
 
-// 3) 有 agent 时直接投递
-const direct = asObject(await B.tools.get('peer_send').execute({ text: '第二条，直达' }))
-check('有 agent 时直达', direct.ok === true && direct.to === 'sess-a', direct)
-check('直达不入队', direct.queued === undefined, direct)
+// 3) 有 agent 时直达
+const directTalk = await talk(18790, { token: TOKEN, from: '尺(Mac)', text: '直达测试', id: randomUUID() })
+check('有 agent 时直达', directTalk?.ok === true && directTalk?.to === 'sess-a', directTalk)
 
 // 4) 按 id 去重
 const id = randomUUID()
