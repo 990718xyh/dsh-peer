@@ -33,6 +33,9 @@ const DEFAULTS = {
 
 const MAX_LINE = 64 * 1024
 
+/** 协议版本。跳的是「发送方」——收报文时只拒绝比我们新的，老的照收。 */
+const PROTOCOL_VERSION = 1
+
 export const inject = ['tools', 'systemPrompt']
 
 function merge(base, extra) {
@@ -161,7 +164,8 @@ export function apply(ctx, config) {
 
   function deliverNow(item) {
     const agent = pickAgent()
-    if (!agent || typeof agent.followup !== 'function') return null
+    if (!agent) return { ok: false, reason: 'no-live-agent' }
+    if (typeof agent.followup !== 'function') return { ok: false, reason: 'agent-has-no-followup' }
     try {
       // 必须是带 id 的完整消息：DSH 的 followup 不会补 id，
       // 缺 id 的 user/message 一旦落盘，整个会话在下次读取时校验失败。
@@ -178,21 +182,21 @@ export function apply(ctx, config) {
       })
     } catch (error) {
       log(`投递失败: ${String(error)}`)
-      return null
+      return { ok: false, reason: 'deliver-failed' }
     }
     delivered.total += 1
     // 记下「这一轮要回谁」：地址优先用收到消息时的 socket 地址，
     // 没有就退回配置里的 peerHost；hop 是对端带过来的，回程时 +1。
     reply.pending = { host: item.host || opts.peerHost || null, hop: Number(item.hop) || 0 }
     reply.lastText = ''
-    return String(agent.id)
+    return { ok: true, to: String(agent.id) }
   }
 
   function flush() {
     let moved = false
     while (queue.length > 0) {
-      const target = deliverNow(queue[0])
-      if (!target) break
+      const result = deliverNow(queue[0])
+      if (!result.ok) break
       queue.shift()
       moved = true
     }
@@ -232,10 +236,11 @@ export function apply(ctx, config) {
       hop: Number.isInteger(payload.hop) ? payload.hop : 0,
       auto: payload.auto === true,
     }
-    const target = deliverNow(item)
-    if (target) return { ok: true, to: target, id }
+    const result = deliverNow(item)
+    if (result.ok) return { ok: true, to: result.to, id }
     enqueue(item)
-    return { ok: true, queued: queue.length, id }
+    // 收下了但投不出去：带上原因，让对面知道是「它没开会话」还是别的
+    return { ok: true, queued: queue.length, id, pending: result.reason }
   }
 
   function handleLine(line, socket) {
@@ -244,6 +249,14 @@ export function apply(ctx, config) {
       payload = JSON.parse(line)
     } catch {
       socket.write(`${JSON.stringify({ ok: false, reason: 'bad-json' })}\n`)
+      return
+    }
+    // 版本只做前进拒绝：没有 v 的老报文照收（v0 兼容），比我们新的才拒。
+    const version = Number(payload.v)
+    if (Number.isInteger(version) && version > PROTOCOL_VERSION) {
+      socket.write(
+        `${JSON.stringify({ ok: false, reason: 'unsupported-version', theirs: version, ours: PROTOCOL_VERSION })}\n`,
+      )
       return
     }
     if (opts.token && payload.token !== opts.token) {
@@ -308,7 +321,9 @@ export function apply(ctx, config) {
         resolve(value)
       }
       const timer = setTimeout(() => finish(null), timeoutMs)
-      socket.on('connect', () => socket.write(`${JSON.stringify({ token: opts.token, ...payload })}\n`))
+      socket.on('connect', () =>
+        socket.write(`${JSON.stringify({ token: opts.token, v: PROTOCOL_VERSION, ...payload })}\n`),
+      )
       socket.on('data', (chunk) => {
         buffer += chunk
         const index = buffer.indexOf('\n')
@@ -357,6 +372,7 @@ export function apply(ctx, config) {
   function status() {
     return {
       name: opts.name,
+      version: PROTOCOL_VERSION,
       listening: `${opts.host}:${opts.port}`,
       agents: agents.size,
       queued: queue.length,
@@ -374,6 +390,17 @@ export function apply(ctx, config) {
   // 表现就是 DSH 的 API 全面不通。
   const renderJson = (_args, value) => [{ type: 'text', text: JSON.stringify(value) }]
 
+  /** 发送结果多给一句人话：结构化字段模型不一定会读，这行它会读。 */
+  const renderSend = (_args, value) => {
+    const result = value ?? {}
+    let line
+    if (result.ok === false) line = `没发出去：${result.reason ?? '未知原因'}`
+    else if (result.to) line = `已投递到 ${result.to}`
+    else if (result.queued) line = `已收下并排队（${result.queued} 条），等对方有活跃会话再投`
+    else line = '已送达'
+    return [{ type: 'text', text: `${line}\n${JSON.stringify(result)}` }]
+  }
+
   const sendTool = {
     name: 'peer_send',
     description: 'Give a message to the agent on the other machine. Returns whether it was delivered or queued. Does not wait for a reply.',
@@ -387,13 +414,13 @@ export function apply(ctx, config) {
     },
     output: {
       schema: { type: 'object', additionalProperties: true },
-      render: renderJson,
+      render: renderSend,
     },
     execute: async ({ text }) => {
       const body = typeof text === 'string' ? text.trim() : ''
       if (!body) return { ok: false, reason: 'empty-text' }
       const online = await verifyPeer()
-      if (!online) return { ok: false, reason: 'peer-offline', host: opts.peerHost || null }
+      if (!online) return { ok: false, reason: 'no-verified-peer', host: opts.peerHost || null }
       const id = randomUUID()
       const reply = await talk(
         opts.peerHost,
