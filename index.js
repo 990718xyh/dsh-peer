@@ -606,8 +606,11 @@ export function apply(ctx, config) {
       if (pending) {
         hop = (Number(pending.hop) || 0) + 1
         if (hop > 1) {
+          // 别再往回发，但**攒下的内容不能丢**：放回队列，下一轮不带 pending 时发。
+          // 这里要是直接 return，peer_send 攒的东西就静默消失了，审计里只剩一条 hop-limit。
+          reply.queue.unshift(...staged)
           reply.skipped += 1
-          audit('auto-reply-skip', { reason: 'hop-limit', hop })
+          audit('auto-reply-skip', { reason: 'hop-limit', hop, kept: staged.length })
           return
         }
         host = pending.host || opts.peerHost
